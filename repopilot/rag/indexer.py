@@ -1,123 +1,91 @@
-"""Offline indexing utilities for RepoPilot documentation."""
+"""Compatibility indexing helpers layered on top of the EasyRAG orchestrator."""
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import re
 from pathlib import Path
 
 from repopilot.compat import Document
-from repopilot.config import get_rag_index_path
+from repopilot.config import get_rag_index_path, get_rag_working_dir, get_rag_workspace, get_repo_root
+from repopilot.rag.easyrag import EasyRAG
+from repopilot.rag.operate import ChunkingConfig, chunk_documents, load_repo_documents
 
-_TEXT_SUFFIXES = {".md", ".mdx", ".rst", ".txt"}
-_EXCLUDED_PARTS = {".git", ".venv", "__pycache__", "node_modules", ".repopilot"}
-
-
-def load_repo_documents(repo_root: str) -> list[Document]:
-    """
-    Load documentation files eligible for indexing.
-
-    Include:
-        README files, docs folders, design notes, ADRs, and plain text setup docs
-
-    Exclude:
-        source code, generated artifacts, virtual environment directories, and
-        large binary or build-output folders that would pollute documentation RAG
-
-    Why:
-        This assistant treats RAG as a documentation layer. Code and PR details
-        belong to GitHub MCP rather than being mixed into the doc index.
-    """
-
-    root = Path(repo_root).resolve()
-    documents: list[Document] = []
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        if any(part in _EXCLUDED_PARTS for part in path.parts):
-            continue
-        if path.suffix.lower() not in _TEXT_SUFFIXES and not path.name.lower().startswith("readme"):
-            continue
-        text = path.read_text(encoding="utf-8", errors="ignore").strip()
-        if not text:
-            continue
-        documents.append(
-            Document(
-                page_content=text,
-                metadata={
-                    "source_type": "doc",
-                    "path": str(path),
-                    "title": path.stem,
-                },
-            )
-        )
-    return documents
+_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+")
 
 
-def chunk_documents(documents: list[Document]) -> list[Document]:
-    """
-    Split documents into retrieval-sized chunks while preserving source metadata.
+def _run_async(awaitable: object) -> object:
+    """Run an async EasyRAG call from synchronous compatibility helpers."""
 
-    Important:
-        Each chunk carries the original document path, title, and a chunk id so
-        later answer assembly can cite the exact source instead of a vague file.
+    try:
+        return asyncio.run(awaitable)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(awaitable)
+        finally:
+            loop.close()
 
-    Boundary handling:
-        This uses a simple character window with overlap to keep the project
-        lightweight. It favors deterministic behavior over embedding-specific
-        splitting logic in the initial implementation.
-    """
 
-    chunk_size = 900
-    overlap = 150
-    chunks: list[Document] = []
-    for document in documents:
-        text = document.page_content
-        start = 0
-        chunk_id = 0
-        while start < len(text):
-            end = min(len(text), start + chunk_size)
-            chunk_text = text[start:end].strip()
-            if chunk_text:
-                metadata = dict(document.metadata)
-                metadata["chunk_id"] = chunk_id
-                chunks.append(Document(page_content=chunk_text, metadata=metadata))
-            if end >= len(text):
-                break
-            start = max(end - overlap, start + 1)
-            chunk_id += 1
-    return chunks
+def _resolve_legacy_storage_location() -> tuple[Path, str]:
+    """Map the legacy index path env var onto a working dir and workspace."""
+
+    if "REPOPILOT_RAG_WORKING_DIR" in os.environ or "REPOPILOT_RAG_WORKSPACE" in os.environ:
+        return get_rag_working_dir(), get_rag_workspace()
+
+    legacy_index_path = get_rag_index_path()
+    if "REPOPILOT_RAG_INDEX_PATH" in os.environ:
+        return legacy_index_path.parent, legacy_index_path.stem
+    return get_rag_working_dir(), get_rag_workspace()
 
 
 def _tokenize(text: str) -> list[str]:
-    """Turn a text chunk into lowercase word tokens for lightweight retrieval."""
+    """Tokenize text for the legacy JSON snapshot."""
 
-    return re.findall(r"[a-zA-Z0-9_]+", text.lower())
+    return _TOKEN_PATTERN.findall(text.lower())
+
+
+async def _build_workspace(documents: list[Document], working_dir: Path, workspace: str) -> None:
+    """Populate one EasyRAG workspace in a single async lifecycle."""
+
+    rag = EasyRAG(working_dir=working_dir, workspace=workspace)
+    await rag.initialize_storages()
+    try:
+        await rag.ainsert_documents(documents)
+    finally:
+        await rag.finalize_storages()
 
 
 def build_vector_index(documents: list[Document]) -> None:
     """
-    Create or refresh the local vector store used for documentation retrieval.
+    Build the EasyRAG workspace and a legacy JSON snapshot for compatibility.
 
-    Why:
-        The project needs an offline, repo-local index so Streamlit can answer
-        questions without rebuilding retrieval state on every request.
-
-    Current implementation:
-        Store chunk text, metadata, and pre-tokenized terms in JSON. This keeps
-        the interface stable while leaving room to swap in a vector database
-        later without changing the rest of the application.
+    The legacy JSON file remains useful for tests and local inspection, while
+    the real retrieval state now lives under the EasyRAG working directory.
     """
 
-    chunks = chunk_documents(documents)
+    working_dir, workspace = _resolve_legacy_storage_location()
+    _run_async(_build_workspace(documents, working_dir, workspace))
+
     payload = [
         {
             "page_content": chunk.page_content,
             "metadata": chunk.metadata,
             "tokens": _tokenize(chunk.page_content),
         }
-        for chunk in chunks
+        for chunk in chunk_documents(documents, config=ChunkingConfig())
     ]
     index_path = get_rag_index_path()
     index_path.parent.mkdir(parents=True, exist_ok=True)
     index_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def rebuild_document_index(repo_root: str | Path | None = None) -> Path:
+    """Discover repository docs and rebuild the default EasyRAG workspace."""
+
+    root = Path(repo_root).resolve() if repo_root is not None else get_repo_root()
+    documents = load_repo_documents(root)
+    build_vector_index(documents)
+    return get_rag_working_dir() / get_rag_workspace()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -9,8 +10,21 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from repopilot.config import get_rag_index_path, get_repo_root
-from repopilot.rag.indexer import build_vector_index, chunk_documents, load_repo_documents
+from repopilot.config import get_rag_working_dir, get_rag_workspace, get_repo_root  # noqa: E402
+from repopilot.rag import EasyRAG, load_repo_documents  # noqa: E402
+
+
+def _run_async(awaitable: object) -> object:
+    """Run async EasyRAG operations from the build script."""
+
+    try:
+        return asyncio.run(awaitable)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(awaitable)
+        finally:
+            loop.close()
 
 
 def main() -> None:
@@ -24,14 +38,25 @@ def main() -> None:
     """
 
     repo_root = get_repo_root()
-    documents = load_repo_documents(str(repo_root))
-    chunks = chunk_documents(documents)
-    build_vector_index(documents)
+    documents = load_repo_documents(repo_root)
+    rag = EasyRAG(working_dir=get_rag_working_dir(), workspace=get_rag_workspace())
+    _run_async(rag.initialize_storages())
+    try:
+        stats = _run_async(rag.ainsert_documents(documents))
+        aggregate = _run_async(rag.get_stats())
+    finally:
+        _run_async(rag.finalize_storages())
 
     print(f"repo_root={repo_root}")
-    print(f"documents={len(documents)}")
-    print(f"chunks={len(chunks)}")
-    print(f"index_path={get_rag_index_path()}")
+    print(f"workspace={rag.workspace}")
+    print(f"working_dir={rag.workspace_dir}")
+    print(f"documents={stats.get('documents', 0)}")
+    print(f"pdf_documents={stats.get('pdf_documents', 0)}")
+    print(f"chunks={stats.get('chunks', 0)}")
+    print(f"entities={aggregate.get('entity_vectors', 0)}")
+    print(f"relations={aggregate.get('relation_vectors', 0)}")
+    print(f"chunk_strategy_counts={aggregate.get('chunk_strategy_counts', {})}")
+    print(f"vector_backend={aggregate.get('vector_backend', 'unknown')}")
 
 
 if __name__ == "__main__":

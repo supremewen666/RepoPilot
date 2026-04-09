@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from repopilot.integrations.github_mcp import build_github_server_config, load_github_tools
+from repopilot.integrations.github_mcp import build_github_server_config, load_github_tools  # noqa: E402
 
 
 async def _main() -> None:

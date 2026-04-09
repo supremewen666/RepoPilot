@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import queue
+import threading
+import time
 import uuid
+from typing import Iterator
 
 from repopilot.agent.runner import invoke_agent
 from repopilot.memory.store import get_relevant_memories, save_memory_if_needed
@@ -36,7 +40,7 @@ def init_session_state() -> None:
         st.session_state.messages = []
 
 
-def handle_user_query(user_query: str) -> FinalResponse:
+def handle_user_query(user_query: str, *, user_id: str, thread_id: str) -> FinalResponse:
     """
     Orchestrate one end-to-end assistant turn from the UI layer.
 
@@ -51,8 +55,6 @@ def handle_user_query(user_query: str) -> FinalResponse:
         It is the bridge between Streamlit events and backend orchestration.
     """
 
-    user_id = st.session_state.user_id
-    thread_id = st.session_state.thread_id
     memory_context = get_relevant_memories(user_id=user_id, query=user_query)
     response = invoke_agent(
         user_query=user_query,
@@ -66,6 +68,53 @@ def handle_user_query(user_query: str) -> FinalResponse:
         assistant_answer=response.answer,
     )
     return response
+
+
+def _answer_chunks(text: str, *, delay: float = 0.01) -> Iterator[str]:
+    """Yield small text chunks so Streamlit can render the answer progressively."""
+
+    words = text.split()
+    if not words:
+        return
+    for index, word in enumerate(words):
+        suffix = " " if index < len(words) - 1 else ""
+        yield f"{word}{suffix}"
+        time.sleep(delay)
+
+
+def stream_user_query(user_query: str, *, user_id: str, thread_id: str, status_placeholder: object) -> FinalResponse:
+    """Run the backend in a thread and keep the UI responsive with live status updates."""
+
+    result_queue: queue.Queue[FinalResponse | Exception] = queue.Queue(maxsize=1)
+
+    def _worker() -> None:
+        try:
+            result_queue.put(handle_user_query(user_query, user_id=user_id, thread_id=thread_id))
+        except Exception as exc:  # pragma: no cover - defensive UI fallback.
+            result_queue.put(exc)
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+    steps = [
+        "Inspecting local documentation index",
+        "Preparing retrieval queries",
+        "Gathering grounded evidence",
+        "Composing the final response",
+    ]
+    tick = 0
+    while thread.is_alive() and result_queue.empty():
+        step = steps[min(tick // 8, len(steps) - 1)]
+        dots = "." * (tick % 4)
+        status_placeholder.markdown(f"_{step}{dots}_")
+        time.sleep(0.15)
+        tick += 1
+
+    outcome = result_queue.get()
+    status_placeholder.empty()
+    if isinstance(outcome, Exception):
+        raise outcome
+    return outcome
 
 
 def render_response(response: FinalResponse) -> None:
@@ -122,8 +171,30 @@ def main() -> None:
         st.markdown(user_query)
 
     with st.chat_message("assistant"):
-        response = handle_user_query(user_query)
-        render_response(response)
+        status_placeholder = st.empty()
+        response = stream_user_query(
+            user_query,
+            user_id=st.session_state.user_id,
+            thread_id=st.session_state.thread_id,
+            status_placeholder=status_placeholder,
+        )
+        streamed_answer = st.write_stream(_answer_chunks(response.answer))
+        response.answer = str(streamed_answer or response.answer)
+        st.caption(f"Confidence: {response.confidence}")
+
+        if response.citations:
+            st.markdown("### Sources")
+            for citation in response.citations:
+                st.markdown(f"- **{citation.label or citation.source_type}**")
+                if citation.url_or_path:
+                    st.code(citation.url_or_path)
+                if citation.snippet:
+                    st.write(citation.snippet)
+
+        if response.used_memory:
+            st.markdown("### Memory Used")
+            for item in response.used_memory:
+                st.write(f"- {item}")
 
     st.session_state.messages.append({"role": "assistant", "content": response.model_dump()})
 

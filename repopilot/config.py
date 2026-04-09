@@ -72,6 +72,18 @@ def get_rag_index_path() -> Path:
     return Path(os.getenv("REPOPILOT_RAG_INDEX_PATH", get_data_dir() / "rag_index.json")).resolve()
 
 
+def get_rag_working_dir() -> Path:
+    """Return the default EasyRAG-style storage root directory."""
+
+    return Path(os.getenv("REPOPILOT_RAG_WORKING_DIR", get_data_dir() / "rag_storage")).resolve()
+
+
+def get_rag_workspace() -> str:
+    """Return the active workspace name for the repository knowledge store."""
+
+    return os.getenv("REPOPILOT_RAG_WORKSPACE", "default").strip() or "default"
+
+
 def get_memory_store_path() -> Path:
     """Return the fallback JSON file used when mem0 is unavailable."""
 
@@ -102,6 +114,30 @@ def get_model_name() -> str:
     return os.getenv("REPOPILOT_MODEL_NAME", get_default_model().split(":", 1)[-1])
 
 
+def _get_role_model_name(env_name: str, default: str) -> str:
+    """Return a role-specific model name with a fallback default."""
+
+    return os.getenv(env_name, default).strip() or default
+
+
+def get_query_model_name() -> str:
+    """Return the model used for query rewriting and MQE generation."""
+
+    return _get_role_model_name("REPOPILOT_QUERY_MODEL_NAME", get_model_name())
+
+
+def get_embedding_model_name() -> str:
+    """Return the embedding model used by the EasyRAG dense vector layer."""
+
+    return _get_role_model_name("REPOPILOT_EMBEDDING_MODEL_NAME", "qwen3-embedding")
+
+
+def get_rerank_model_name() -> str:
+    """Return the reranker model used by the EasyRAG rerank stage."""
+
+    return _get_role_model_name("REPOPILOT_RERANK_MODEL_NAME", "qwen3-rerank")
+
+
 def get_openai_api_key() -> str:
     """
     Return the API key used by the OpenAI-compatible chat client.
@@ -123,3 +159,36 @@ def get_openai_base_url() -> str | None:
 
     value = os.getenv("OPENAI_BASE_URL", "").strip()
     return value or None
+
+
+def _get_role_base_url(env_name: str) -> str | None:
+    """Return a role-specific OpenAI-compatible base URL with a shared fallback."""
+
+    value = os.getenv(env_name, "").strip()
+    if value:
+        return value
+    return get_openai_base_url()
+
+
+def get_query_base_url() -> str | None:
+    """Return the base URL used for query rewriting and MQE generation."""
+
+    return _get_role_base_url("REPOPILOT_QUERY_BASE_URL")
+
+
+def get_embedding_base_url() -> str | None:
+    """Return the base URL used for embedding generation."""
+
+    return _get_role_base_url("REPOPILOT_EMBEDDING_BASE_URL")
+
+
+def get_rerank_base_url() -> str | None:
+    """Return the base URL used for reranking."""
+
+    return _get_role_base_url("REPOPILOT_RERANK_BASE_URL")
+
+
+def has_openai_compatible_config() -> bool:
+    """Return whether OpenAI-compatible model calls are configured."""
+
+    return bool(get_openai_api_key().strip())
