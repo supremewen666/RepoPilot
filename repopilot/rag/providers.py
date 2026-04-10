@@ -12,6 +12,8 @@ from urllib.parse import urlsplit, urlunsplit
 from repopilot.config import (
     get_embedding_base_url,
     get_embedding_model_name,
+    get_kg_base_url,
+    get_kg_model_name,
     get_openai_api_key,
     get_query_base_url,
     get_query_model_name,
@@ -173,6 +175,26 @@ def _extract_text_from_chat_response(response: Any) -> str:
         raise RuntimeError(f"Could not parse chat response: {exc}") from exc
 
 
+def _parse_json_object(text: str) -> dict[str, Any]:
+    """Parse a JSON object from raw model output with light cleanup."""
+
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if "\n" in cleaned:
+            cleaned = cleaned.split("\n", 1)[1]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    candidate = cleaned[start : end + 1] if start >= 0 and end >= start else cleaned
+    payload = json.loads(candidate)
+    if not isinstance(payload, dict):
+        raise RuntimeError("Model output is not a JSON object.")
+    return payload
+
+
 def default_query_model_func(
     prompt: str,
     *,
@@ -246,6 +268,53 @@ def default_embedding_func(texts: list[Any]) -> list[list[float]]:
     client = _require_client(base_url)
     response = client.embeddings.create(model=model_name, input=texts)
     return [list(item.embedding) for item in response.data]
+
+
+def default_kg_model_func(
+    text: str,
+    *,
+    entity_types: list[str] | tuple[str, ...],
+    max_entities: int,
+    max_relations: int,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, list[dict[str, str]]]:
+    """Extract entities and relations as structured JSON through a chat model."""
+
+    client = _require_client(get_kg_base_url())
+    allowed_types = ", ".join(entity_types)
+    page_context = ""
+    if metadata:
+        title = str(metadata.get("title", "")).strip()
+        path = str(metadata.get("relative_path") or metadata.get("path") or "").strip()
+        page_context = f"Title: {title}\nPath: {path}\n" if title or path else ""
+    system_prompt = (
+        "You extract repository-architecture knowledge graph data from technical documentation. "
+        "Return only JSON with shape "
+        '{"entities":[{"name":"","type":"","description":""}],"relations":[{"source":"","target":"","relation":"","description":""}]}. '
+        f"Allowed entity types: {allowed_types}. "
+        "Prefer architecture-level concepts such as modules, services, components, tools, workflows, configs, and dependencies. "
+        f"Return at most {max_entities} entities and {max_relations} relations. "
+        "Relation names must be concise lowercase snake_case. "
+        "Only include entities and relations grounded in the provided text."
+    )
+    response = client.chat.completions.create(
+        model=get_kg_model_name(),
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"{page_context}Content:\n{text}"},
+        ],
+        temperature=0.0,
+        response_format={"type": "json_object"},
+    )
+    parsed = _parse_json_object(_extract_text_from_chat_response(response))
+    entities = parsed.get("entities", [])
+    relations = parsed.get("relations", [])
+    if not isinstance(entities, list) or not isinstance(relations, list):
+        raise RuntimeError("KG extraction response is missing entities or relations arrays.")
+    return {
+        "entities": [item for item in entities if isinstance(item, dict)],
+        "relations": [item for item in relations if isinstance(item, dict)],
+    }
 
 
 def default_reranker_func(query: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:

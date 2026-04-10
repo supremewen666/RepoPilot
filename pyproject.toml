@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repopilot"
+version = "0.1.0"
+description = "Single-repository engineering assistant with EasyRAG, Streamlit UI, and GitHub MCP integration."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "streamlit>=1.44.0",
+  "fastapi>=0.115.0",
+  "httpx>=0.28.0",
+  "langchain>=0.3.0",
+  "langchain-core>=0.3.0",
+  "langchain-openai>=0.2.0",
+  "langchain-mcp-adapters>=0.1.0",
+  "mem0ai>=0.1.0",
+  "networkx>=3.3",
+  "numpy>=2.0.0",
+  "hnswlib>=0.8.0",
+  "openai>=1.0.0",
+  "psycopg[binary]>=3.2.0",
+  "pypdf>=5.0.0",
+  "pydantic>=2.8.0",
+  "python-dotenv>=1.0.1",
+  "uvicorn>=0.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["repopilot*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

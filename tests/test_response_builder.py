@@ -2,7 +2,7 @@
 
 import unittest
 
-from repopilot.response_builder import build_final_response
+from repopilot.service.response_builder import build_final_response
 
 
 class ResponseBuilderTestCase(unittest.TestCase):

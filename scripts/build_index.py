@@ -1,7 +1,8 @@
-"""Build the local RAG index for RepoPilot documentation."""
+"""Build or maintain the local RAG index for RepoPilot documentation."""
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import sys
 from pathlib import Path
@@ -11,7 +12,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from repopilot.config import get_rag_working_dir, get_rag_workspace, get_repo_root  # noqa: E402
-from repopilot.rag import EasyRAG, load_repo_documents  # noqa: E402
+from repopilot.rag import EasyRAG  # noqa: E402
+from repopilot.rag.indexing import rebuild_document_index  # noqa: E402
 
 
 def _run_async(awaitable: object) -> object:
@@ -27,29 +29,34 @@ def _run_async(awaitable: object) -> object:
             loop.close()
 
 
-def main() -> None:
-    """
-    Build or refresh the repo-local documentation index used by RepoPilot.
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments for index maintenance."""
 
-    Why:
-        RAG retrieval is only useful after the repository's docs have been read,
-        chunked, and serialized into the local index file. This script gives the
-        project a single explicit command for that setup step.
-    """
+    parser = argparse.ArgumentParser(description="Build or maintain the RepoPilot RAG index.")
+    parser.add_argument(
+        "--action",
+        choices=("rebuild", "update", "delete"),
+        default="rebuild",
+        help="Index maintenance action. `update` is an alias of `rebuild`.",
+    )
+    parser.add_argument(
+        "--doc-id",
+        dest="doc_ids",
+        action="append",
+        default=[],
+        help="Document ID to target. Repeat for multiple documents.",
+    )
+    return parser.parse_args([] if argv is None else argv)
 
-    repo_root = get_repo_root()
-    documents = load_repo_documents(repo_root)
-    rag = EasyRAG(working_dir=get_rag_working_dir(), workspace=get_rag_workspace())
-    _run_async(rag.initialize_storages())
-    try:
-        stats = _run_async(rag.ainsert_documents(documents))
-        aggregate = _run_async(rag.get_stats())
-    finally:
-        _run_async(rag.finalize_storages())
 
-    print(f"repo_root={repo_root}")
+def _print_summary(rag: EasyRAG, stats: dict[str, int], aggregate: dict[str, int], *, action: str, targeted_doc_ids: list[str]) -> None:
+    """Print a compact summary of the index maintenance result."""
+
+    print(f"repo_root={get_repo_root()}")
     print(f"workspace={rag.workspace}")
     print(f"working_dir={rag.workspace_dir}")
+    print(f"action={action}")
+    print(f"targeted_doc_ids={targeted_doc_ids}")
     print(f"documents={stats.get('documents', 0)}")
     print(f"pdf_documents={stats.get('pdf_documents', 0)}")
     print(f"chunks={stats.get('chunks', 0)}")
@@ -59,5 +66,45 @@ def main() -> None:
     print(f"vector_backend={aggregate.get('vector_backend', 'unknown')}")
 
 
+def main(argv: list[str] | None = None) -> None:
+    """Build, rebuild, update, or delete RepoPilot document index entries."""
+
+    args = _parse_args(argv)
+    action = "rebuild" if args.action == "update" else args.action
+    targeted_doc_ids = list(dict.fromkeys(str(doc_id).strip() for doc_id in args.doc_ids if str(doc_id).strip()))
+
+    if action == "delete":
+        rag = EasyRAG(working_dir=get_rag_working_dir(), workspace=get_rag_workspace())
+        _run_async(rag.initialize_storages())
+        try:
+            stats = _run_async(rag.adelete_documents(targeted_doc_ids))
+            aggregate = _run_async(rag.get_stats())
+        finally:
+            _run_async(rag.finalize_storages())
+        _print_summary(rag, stats, aggregate, action=action, targeted_doc_ids=targeted_doc_ids)
+        return
+
+    rebuild_document_index(get_repo_root(), doc_ids=targeted_doc_ids or None)
+    rag = EasyRAG(working_dir=get_rag_working_dir(), workspace=get_rag_workspace())
+    _run_async(rag.initialize_storages())
+    try:
+        aggregate = _run_async(rag.get_stats())
+        current_documents = EasyRAG.load_repo_documents(get_repo_root())
+        filtered_documents = (
+            [document for document in current_documents if str(document.metadata.get("doc_id", "")).strip() in set(targeted_doc_ids)]
+            if targeted_doc_ids
+            else current_documents
+        )
+        stats = {
+            "documents": len(filtered_documents),
+            "pdf_documents": sum(1 for document in filtered_documents if document.metadata.get("source_type") == "pdf"),
+            "chunks": int(aggregate.get("chunks", 0)),
+        }
+    finally:
+        _run_async(rag.finalize_storages())
+
+    _print_summary(rag, stats, aggregate, action=action, targeted_doc_ids=targeted_doc_ids)
+
+
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

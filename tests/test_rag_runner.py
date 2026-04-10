@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from repopilot.agent import runner
+from repopilot.service.agent import runtime as runner
 from repopilot.rag import EasyRAG
 
 
@@ -103,7 +103,7 @@ class RunnerEasyRAGIntegrationTestCase(unittest.TestCase):
                     "GET https://api.github.com/repos/supremewen/RepoPilot: 404 Not Found []"
                 )
 
-        docs_only = runner.FallbackAgent(tools=[], system_prompt="docs-only")
+        docs_only = runner.FallbackAgent(tools=[], system_prompt="docs-only", rag_tool_getter=lambda: None)
 
         with mock.patch.object(runner, "build_agent", return_value=BrokenGitHubAgent()), mock.patch.object(
             runner, "_build_docs_only_fallback", return_value=docs_only

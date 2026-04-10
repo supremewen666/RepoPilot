@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import unittest
 
-from repopilot.integrations.github_mcp import build_github_server_config
+from repopilot.service.integrations.github_mcp import build_github_server_config
 
 
 class GitHubMCPConfigTestCase(unittest.TestCase):

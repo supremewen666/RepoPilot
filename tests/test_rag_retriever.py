@@ -11,11 +11,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from repopilot.compat import Document
-from repopilot.rag import EasyRAG, QueryParam, build_vector_index, search_docs, search_docs_tool
-from repopilot.rag.chunking import ChunkingConfig
-from repopilot.rag.indexer import load_repo_documents
-from repopilot.rag.operate import chunk_documents
+import numpy as np
+
+from repopilot.support.optional_deps import Document
+from repopilot.rag import EasyRAG, KGExtractionConfig, QueryParam
+from repopilot.rag.indexing import ChunkingConfig, build_vector_index, chunk_documents, load_repo_documents, rebuild_document_index
+from repopilot.service.agent.tools import create_search_docs_tool
 from scripts import build_index
 
 _KEYWORDS = [
@@ -76,6 +77,71 @@ def _stub_reranker(query: str, items: list[dict[str, object]]) -> list[dict[str,
     return scored
 
 
+def _stub_kg_model_func(
+    text: str,
+    *,
+    entity_types: list[str],
+    max_entities: int,
+    max_relations: int,
+    metadata: dict[str, object] | None = None,
+) -> dict[str, list[dict[str, str]]]:
+    """Return deterministic architecture-oriented KG extraction results."""
+
+    del metadata
+    allowed = set(entity_types)
+
+    def pick(*candidates: str) -> str:
+        for candidate in candidates:
+            if candidate in allowed:
+                return candidate
+        return entity_types[0] if entity_types else "concept"
+
+    entities: list[dict[str, str]] = [
+        {"name": "RepoPilot", "type": pick("component", "module"), "description": "Repository assistant architecture root."},
+    ]
+    relations: list[dict[str, str]] = []
+    lowered = text.lower()
+
+    if "easyrag" in lowered:
+        entities.append({"name": "EasyRAG", "type": pick("module", "component"), "description": "Retrieval subsystem."})
+        relations.append({"source": "RepoPilot", "target": "EasyRAG", "relation": "uses", "description": "RepoPilot uses EasyRAG for repository retrieval."})
+    if "langchain" in lowered:
+        entities.append({"name": "LangChain", "type": pick("dependency", "tool"), "description": "Orchestration dependency."})
+        relations.append({"source": "RepoPilot", "target": "LangChain", "relation": "depends_on", "description": "RepoPilot depends on LangChain orchestration."})
+    if "streamlit" in lowered:
+        entities.append({"name": "Streamlit", "type": pick("tool", "interface"), "description": "UI layer."})
+        relations.append({"source": "RepoPilot", "target": "Streamlit", "relation": "uses", "description": "RepoPilot uses Streamlit as the UI layer."})
+    if "github mcp" in lowered:
+        entities.append({"name": "GitHub MCP", "type": pick("tool", "interface"), "description": "GitHub integration tool."})
+        relations.append({"source": "RepoPilot", "target": "GitHub MCP", "relation": "integrates_with", "description": "RepoPilot integrates with GitHub MCP."})
+    if "workflow" in lowered or "retrieval" in lowered:
+        entities.append({"name": "Retrieval Workflow", "type": pick("workflow", "concept"), "description": "Retrieval flow for repository answers."})
+        relations.append({"source": "RepoPilot", "target": "Retrieval Workflow", "relation": "orchestrates", "description": "RepoPilot orchestrates the retrieval workflow."})
+
+    deduped_entities: list[dict[str, str]] = []
+    seen_entities: set[str] = set()
+    for entity in entities:
+        key = entity["name"].lower()
+        if key in seen_entities:
+            continue
+        seen_entities.add(key)
+        deduped_entities.append(entity)
+
+    deduped_relations: list[dict[str, str]] = []
+    seen_relations: set[tuple[str, str, str]] = set()
+    for relation in relations:
+        key = (relation["source"].lower(), relation["target"].lower(), relation["relation"])
+        if key in seen_relations:
+            continue
+        seen_relations.add(key)
+        deduped_relations.append(relation)
+
+    return {
+        "entities": deduped_entities[:max_entities],
+        "relations": deduped_relations[:max_relations],
+    }
+
+
 class EasyRAGLifecycleTestCase(unittest.TestCase):
     """Verify lifecycle, persistence, and query modes."""
 
@@ -126,9 +192,65 @@ class EasyRAGLifecycleTestCase(unittest.TestCase):
                 aggregate = _run(rag.get_stats())
                 self.assertGreaterEqual(aggregate["graph_nodes"], 4)
                 self.assertGreaterEqual(aggregate["entity_vectors"], 1)
-                self.assertEqual(aggregate["vector_backend"], "dense_embedding")
+                self.assertIn(aggregate["vector_backend"], {"hnsw_embedding", "dense_embedding"})
             finally:
                 _run(rag.finalize_storages())
+
+    def test_hnsw_backend_is_preferred_when_available(self) -> None:
+        class FakeHNSWIndex:
+            def __init__(self, space: str, dim: int) -> None:
+                self.space = space
+                self.dim = dim
+                self._embeddings = np.zeros((0, dim), dtype=np.float32)
+                self._labels = np.zeros((0,), dtype=np.int32)
+
+            def init_index(self, max_elements: int, ef_construction: int, M: int) -> None:
+                del max_elements, ef_construction, M
+
+            def add_items(self, embeddings: np.ndarray, labels: np.ndarray) -> None:
+                self._embeddings = np.array(embeddings, dtype=np.float32)
+                self._labels = np.array(labels, dtype=np.int32)
+
+            def set_ef(self, ef: int) -> None:
+                del ef
+
+            def knn_query(self, query_embedding: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+                normalized_records = self._embeddings / np.maximum(np.linalg.norm(self._embeddings, axis=1, keepdims=True), 1e-12)
+                normalized_query = query_embedding / np.maximum(np.linalg.norm(query_embedding, axis=1, keepdims=True), 1e-12)
+                scores = normalized_records @ normalized_query[0]
+                ranked = np.argsort(scores)[::-1][:k]
+                distances = 1.0 - scores[ranked]
+                return self._labels[ranked][None, :], distances[None, :]
+
+        fake_hnswlib = mock.Mock(Index=FakeHNSWIndex)
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch("repopilot.rag.storage.local.hnswlib", fake_hnswlib):
+            rag = EasyRAG(
+                working_dir=tmp_dir,
+                workspace="hnsw",
+                embedding_func=_stub_embedding,
+                query_model_func=_stub_query_model,
+            )
+            _run(rag.initialize_storages())
+            try:
+                _run(
+                    rag.ainsert(
+                        [
+                            "# Architecture\nRepoPilot uses EasyRAG for retrieval orchestration.\n",
+                            "# Setup\nRepoPilot uses Streamlit for the UI.\n",
+                        ],
+                        ids=["doc::architecture", "doc::setup"],
+                        file_paths=["docs/architecture.md", "docs/setup.md"],
+                    )
+                )
+                result = _run(rag.aquery("How does EasyRAG retrieval work?", QueryParam(mode="naive", rewrite_enabled=False, mqe_enabled=False)))
+                aggregate = _run(rag.get_stats())
+            finally:
+                _run(rag.finalize_storages())
+
+        self.assertTrue(result.citations)
+        self.assertIn("EasyRAG", result.citations[0]["snippet"])
+        self.assertEqual(result.metadata["vector_backend"], "hnsw_embedding")
+        self.assertEqual(aggregate["vector_backend"], "hnsw_embedding")
 
     def test_workspace_isolation_and_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -184,6 +306,165 @@ class EasyRAGLifecycleTestCase(unittest.TestCase):
             self.assertTrue(result.citations)
             self.assertEqual(result.metadata["vector_backend"], "fallback_token")
 
+    def test_delete_documents_removes_all_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            rag = EasyRAG(
+                working_dir=tmp_dir,
+                workspace="delete",
+                embedding_func=_stub_embedding,
+                query_model_func=_stub_query_model,
+                llm_model_func=_stub_kg_model_func,
+            )
+            _run(rag.initialize_storages())
+            try:
+                _run(
+                    rag.ainsert(
+                        ["# Architecture\nRepoPilot uses EasyRAG and LangChain for retrieval.\n"],
+                        ids=["doc::architecture"],
+                        file_paths=["docs/architecture.md"],
+                    )
+                )
+                deleted = _run(rag.adelete_documents(["doc::architecture"]))
+                result = _run(rag.aquery("LangChain", QueryParam(mode="naive", rewrite_enabled=False, mqe_enabled=False)))
+                aggregate = _run(rag.get_stats())
+            finally:
+                _run(rag.finalize_storages())
+
+            self.assertEqual(deleted["documents"], 1)
+            self.assertFalse(result.citations)
+            self.assertEqual(aggregate["documents"], 0)
+            self.assertEqual(aggregate["chunks"], 0)
+            self.assertEqual(aggregate["entity_vectors"], 0)
+            self.assertEqual(aggregate["relation_vectors"], 0)
+            self.assertEqual(aggregate["status_records"], 0)
+
+    def test_upsert_replaces_existing_doc_id_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            rag = EasyRAG(
+                working_dir=tmp_dir,
+                workspace="update",
+                embedding_func=_stub_embedding,
+                query_model_func=_stub_query_model,
+                llm_model_func=_stub_kg_model_func,
+            )
+            _run(rag.initialize_storages())
+            try:
+                _run(
+                    rag.ainsert(
+                        ["# Architecture\nRepoPilot uses LangChain for orchestration.\n"],
+                        ids=["doc::architecture"],
+                        file_paths=["docs/architecture.md"],
+                    )
+                )
+                _run(
+                    rag.ainsert(
+                        ["# Architecture\nRepoPilot uses Streamlit for the UI layer.\n"],
+                        ids=["doc::architecture"],
+                        file_paths=["docs/architecture.md"],
+                    )
+                )
+                stored_chunk = _run(rag.kv_storage.get_chunk("doc::architecture::chunk::0"))
+                old_result = _run(rag.aquery("LangChain", QueryParam(mode="naive", rewrite_enabled=False, mqe_enabled=False)))
+                new_result = _run(rag.aquery("Streamlit", QueryParam(mode="naive", rewrite_enabled=False, mqe_enabled=False)))
+            finally:
+                _run(rag.finalize_storages())
+
+            self.assertNotIn("LangChain", stored_chunk["text"])
+            self.assertTrue(old_result.citations)
+            self.assertNotIn("LangChain", old_result.citations[0]["snippet"])
+            self.assertTrue(new_result.citations)
+            self.assertIn("Streamlit", new_result.citations[0]["snippet"])
+
+    def test_shared_entity_survives_single_document_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            rag = EasyRAG(
+                working_dir=tmp_dir,
+                workspace="shared",
+                embedding_func=_stub_embedding,
+                query_model_func=_stub_query_model,
+                llm_model_func=_stub_kg_model_func,
+            )
+            _run(rag.initialize_storages())
+            try:
+                _run(
+                    rag.ainsert(
+                        [
+                            "# Alpha\nRepoPilot uses EasyRAG for retrieval.\n",
+                            "# Beta\nRepoPilot uses Streamlit for the UI.\n",
+                        ],
+                        ids=["doc::alpha", "doc::beta"],
+                        file_paths=["docs/alpha.md", "docs/beta.md"],
+                    )
+                )
+                shared_before = _run(rag.graph_storage.get_node("entity::repopilot"))
+                _run(rag.adelete_documents(["doc::alpha"]))
+                shared_after = _run(rag.graph_storage.get_node("entity::repopilot"))
+                beta_result = _run(rag.aquery("Streamlit", QueryParam(mode="naive", rewrite_enabled=False, mqe_enabled=False)))
+            finally:
+                _run(rag.finalize_storages())
+
+            self.assertEqual(sorted(shared_before["doc_ids"]), ["doc::alpha", "doc::beta"])
+            self.assertEqual(shared_after["doc_ids"], ["doc::beta"])
+            self.assertTrue(beta_result.citations)
+            self.assertIn("Streamlit", beta_result.citations[0]["snippet"])
+
+    def test_llm_kg_extraction_populates_typed_entity_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            rag = EasyRAG(
+                working_dir=tmp_dir,
+                workspace="kg",
+                embedding_func=_stub_embedding,
+                query_model_func=_stub_query_model,
+                llm_model_func=_stub_kg_model_func,
+                kg_extraction_config=KGExtractionConfig(entity_types=("component", "workflow", "tool", "dependency")),
+            )
+            _run(rag.initialize_storages())
+            try:
+                _run(
+                    rag.ainsert(
+                        ["# Architecture\nRepoPilot uses EasyRAG, LangChain, and a retrieval workflow.\n"],
+                        ids=["doc::architecture"],
+                        file_paths=["docs/architecture.md"],
+                    )
+                )
+                repopilot_entity = _run(rag.graph_storage.get_node("entity::repopilot"))
+                aggregate = _run(rag.get_stats())
+            finally:
+                _run(rag.finalize_storages())
+
+            self.assertIn("component", repopilot_entity["entity_types"])
+            self.assertTrue(repopilot_entity["description"])
+            self.assertGreaterEqual(aggregate["relation_vectors"], 1)
+
+    def test_easyrag_uses_env_kg_entity_types_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch.dict(
+            os.environ,
+            {"REPOPILOT_KG_ENTITY_TYPES": "workflow,tool"},
+            clear=False,
+        ):
+            rag = EasyRAG(
+                working_dir=tmp_dir,
+                workspace="kg-env",
+                embedding_func=_stub_embedding,
+                query_model_func=_stub_query_model,
+                llm_model_func=_stub_kg_model_func,
+            )
+            _run(rag.initialize_storages())
+            try:
+                _run(
+                    rag.ainsert(
+                        ["# Architecture\nRepoPilot uses Streamlit and a retrieval workflow.\n"],
+                        ids=["doc::architecture"],
+                        file_paths=["docs/architecture.md"],
+                    )
+                )
+                workflow_entity = _run(rag.graph_storage.get_node("entity::retrieval-workflow"))
+            finally:
+                _run(rag.finalize_storages())
+
+            self.assertEqual(rag.kg_extraction_config.entity_types, ("workflow", "tool"))
+            self.assertEqual(workflow_entity["entity_types"], ["workflow"])
+
 
 class ChunkingAndLoadingTestCase(unittest.TestCase):
     """Verify loading and chunk strategy selection."""
@@ -222,7 +503,7 @@ class ChunkingAndLoadingTestCase(unittest.TestCase):
                 mock.Mock(extract_text=mock.Mock(return_value="Page three setup details")),
             ]
             fake_reader = mock.Mock(pages=fake_pages)
-            with mock.patch("repopilot.rag.documents.PdfReader", return_value=fake_reader):
+            with mock.patch("repopilot.rag.indexing.loaders.PdfReader", return_value=fake_reader):
                 documents = load_repo_documents(root)
 
             pdf_documents = [document for document in documents if document.metadata["source_type"] == "pdf"]
@@ -243,7 +524,7 @@ class ChunkingAndLoadingTestCase(unittest.TestCase):
                 mock.Mock(extract_text=mock.Mock(return_value=""), images=[fake_image]),
             ]
             fake_reader = mock.Mock(pages=fake_pages)
-            with mock.patch("repopilot.rag.documents.PdfReader", return_value=fake_reader):
+            with mock.patch("repopilot.rag.indexing.loaders.PdfReader", return_value=fake_reader):
                 documents = load_repo_documents(root)
 
             self.assertEqual(len(documents), 1)
@@ -254,10 +535,10 @@ class ChunkingAndLoadingTestCase(unittest.TestCase):
             self.assertTrue(Path(image_paths[0]).exists())
 
 
-class CompatibilityLayerTestCase(unittest.TestCase):
-    """Verify legacy wrappers continue to work on top of EasyRAG."""
+class IndexingHelperTestCase(unittest.TestCase):
+    """Verify canonical indexing helpers still support local smoke flows."""
 
-    def test_build_vector_index_search_docs_and_tool(self) -> None:
+    def test_build_vector_index_and_search_tool(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             documents = [
                 Document(
@@ -281,11 +562,27 @@ class CompatibilityLayerTestCase(unittest.TestCase):
                 clear=False,
             ):
                 build_vector_index(documents)
-                results = search_docs("How does workflow orchestration work?", k=3)
-                tool_results = search_docs_tool.invoke({"query": "What uses LangChain?"})
+                rag = EasyRAG(
+                    working_dir=tmp_dir,
+                    workspace="compat",
+                    embedding_func=_stub_embedding,
+                    query_model_func=_stub_query_model,
+                )
+                _run(rag.initialize_storages())
+                try:
+                    results = _run(
+                        rag.aquery(
+                            "How does workflow orchestration work?",
+                            QueryParam(mode="naive", top_k=3, chunk_top_k=3, rewrite_enabled=False, mqe_enabled=False),
+                        )
+                    )
+                    tool = create_search_docs_tool(lambda: rag, default_mode="naive", rewrite_enabled=False, mqe_enabled=False)
+                    tool_results = tool.invoke({"query": "What uses LangChain?"})
+                finally:
+                    _run(rag.finalize_storages())
 
-            self.assertTrue(results)
-            self.assertIn("LangChain", results[0].page_content)
+            self.assertTrue(results.citations)
+            self.assertIn("LangChain", results.citations[0]["snippet"])
             self.assertIn("architecture", tool_results)
 
 
@@ -321,6 +618,54 @@ class BuildIndexScriptTestCase(unittest.TestCase):
             self.assertIn("workspace=demo", output)
             self.assertIn("vector_backend=fallback_token", output)
             self.assertTrue((repo_root / ".repopilot" / "rag_storage" / "demo" / "kv" / "documents.json").exists())
+
+    def test_rebuild_document_index_full_sync_removes_stale_docs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            repo_root = Path(tmp_dir) / "repo"
+            docs_dir = repo_root / "docs"
+            docs_dir.mkdir(parents=True)
+            architecture_path = docs_dir / "architecture.md"
+            setup_path = docs_dir / "setup.md"
+            architecture_path.write_text("# Architecture\nRepoPilot uses EasyRAG.\n", encoding="utf-8")
+            setup_path.write_text("# Setup\nRepoPilot uses Streamlit.\n", encoding="utf-8")
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "REPOPILOT_REPO_ROOT": str(repo_root),
+                    "REPOPILOT_RAG_WORKING_DIR": str(repo_root / ".repopilot" / "rag_storage"),
+                    "REPOPILOT_RAG_WORKSPACE": "sync",
+                    "OPENAI_API_KEY": "",
+                },
+                clear=False,
+            ):
+                initial_docs = load_repo_documents(repo_root)
+                removed_doc_id = next(
+                    str(document.metadata["doc_id"])
+                    for document in initial_docs
+                    if document.metadata["title"] == "setup"
+                )
+                rebuild_document_index(repo_root)
+                setup_path.unlink()
+                rebuild_document_index(repo_root)
+
+                rag = EasyRAG(
+                    working_dir=repo_root / ".repopilot" / "rag_storage",
+                    workspace="sync",
+                    embedding_func=_stub_embedding,
+                    query_model_func=_stub_query_model,
+                )
+                _run(rag.initialize_storages())
+                try:
+                    aggregate = _run(rag.get_stats())
+                    removed_status = _run(rag.doc_status_storage.get_status(removed_doc_id))
+                    removed_result = _run(rag.aquery("Streamlit", QueryParam(mode="naive", rewrite_enabled=False, mqe_enabled=False)))
+                finally:
+                    _run(rag.finalize_storages())
+
+            self.assertEqual(aggregate["documents"], 1)
+            self.assertIsNone(removed_status)
+            self.assertFalse(removed_result.citations)
 
 
 if __name__ == "__main__":

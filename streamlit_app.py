@@ -8,9 +8,9 @@ import time
 import uuid
 from typing import Iterator
 
-from repopilot.agent.runner import invoke_agent
+from repopilot.service.agent.runtime import invoke_agent
 from repopilot.memory.store import get_relevant_memories, save_memory_if_needed
-from repopilot.schemas import FinalResponse
+from repopilot.service.schemas import FinalResponse
 
 try:
     import streamlit as st
@@ -148,7 +148,7 @@ def main() -> None:
     """Run the Streamlit application if the dependency is installed."""
 
     if st is None:
-        raise RuntimeError("Streamlit is not installed. Install requirements.txt to run the UI.")
+        raise RuntimeError("Streamlit is not installed. Install the project dependencies with `pip install -e .` to run the UI.")
 
     st.set_page_config(page_title="RepoPilot", page_icon=":bookmark_tabs:", layout="wide")
     st.title("RepoPilot")

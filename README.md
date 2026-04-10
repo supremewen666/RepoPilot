@@ -1,6 +1,6 @@
 # RepoPilot
 
-RepoPilot is a single-repository engineering assistant built for interview-demo scope. It combines an EasyRAG-style repository knowledge subsystem with PDF loading, Qwen3 embedding and reranking hooks, query rewriting + MQE preprocessing, GitHub MCP read-only access, lightweight long-term memory, and a Streamlit chat UI.
+RepoPilot is a single-repository engineering assistant built for interview-demo scope. It combines an EasyRAG-style repository knowledge subsystem with PDF loading, Qwen3 embedding and reranking hooks, query rewriting + MQE preprocessing, graph curation APIs, an optional FastAPI service surface, GitHub MCP read-only access, lightweight long-term memory, and a Streamlit chat UI.
 
 ## What It Does
 
@@ -40,10 +40,17 @@ source .venv/bin/activate
 ### 2. Install dependencies
 
 ```bash
-pip install -r requirements.txt
+pip install -e .
 ```
 
-`python-dotenv` is included in `requirements.txt`, so `.env` values are loaded automatically at runtime.
+For test and local development tools, install the dev extras:
+
+```bash
+pip install -e ".[dev]"
+```
+
+`requirements.txt` is kept as a compatibility export of the same runtime dependency set for environments that still prefer `pip install -r requirements.txt`.
+`python-dotenv` is included in the project dependencies, so `.env` values are loaded automatically at runtime.
 
 ### 3. Configure environment variables
 
@@ -71,9 +78,20 @@ Optional setup for OpenAI-compatible providers:
 - `REPOPILOT_QUERY_MODEL_NAME`
 - `REPOPILOT_EMBEDDING_MODEL_NAME`
 - `REPOPILOT_RERANK_MODEL_NAME`
+- `REPOPILOT_KG_MODEL_NAME`
 - `REPOPILOT_QUERY_BASE_URL`
 - `REPOPILOT_EMBEDDING_BASE_URL`
 - `REPOPILOT_RERANK_BASE_URL`
+- `REPOPILOT_KG_BASE_URL`
+- `REPOPILOT_KG_ENTITY_TYPES`
+
+Optional setup for the production RAG backend bundle:
+
+- `REPOPILOT_RAG_STORAGE_BACKEND=postgres_qdrant`
+- `REPOPILOT_POSTGRES_DSN`
+- `REPOPILOT_QDRANT_URL`
+- `REPOPILOT_QDRANT_API_KEY`
+- `REPOPILOT_QDRANT_COLLECTION_PREFIX`
 
 DashScope notes:
 
@@ -91,7 +109,16 @@ Before asking documentation questions, build the local RAG workspace:
 python scripts/build_index.py
 ```
 
-This scans repo-local docs such as `README`, `docs/`, `.txt`, and text-based PDF documents, then writes EasyRAG-style storage files under `.repopilot/rag_storage/<workspace>/`.
+This performs a full sync over repo-local docs such as `README`, `docs/`, `.txt`, and text-based PDF documents, then writes EasyRAG-style storage files under `.repopilot/rag_storage/<workspace>/`.
+
+Targeted maintenance is also supported:
+
+```bash
+python scripts/build_index.py --action rebuild --doc-id doc::docs-architecture-md
+python scripts/build_index.py --action delete --doc-id doc::docs-architecture-md
+```
+
+`update` is an alias of `rebuild`. Rebuild by `doc_id` replaces the selected documents in place, while full rebuild removes stale indexed docs that no longer exist in the repository.
 
 ## Run the App
 
@@ -104,6 +131,31 @@ Open the local Streamlit URL in your browser and ask questions such as:
 - `What does RepoPilot do?`
 - `How is documentation retrieval implemented?`
 - `What tools are exposed to the agent?`
+
+## Run the Service
+
+RepoPilot also exposes the RAG/KG layer through FastAPI:
+
+```bash
+uvicorn repopilot.service.api.app:create_app --factory --reload
+```
+
+The first service cut includes:
+
+- `POST /rag/query`
+- `POST /rag/index/tasks`
+- `GET /rag/index/tasks`
+- `GET /rag/index/tasks/{task_id}`
+- `POST /rag/kg/entities`
+- `PATCH /rag/kg/entities/{entity_id}`
+- `DELETE /rag/kg/entities/{entity_id}`
+- `POST /rag/kg/entities/merge`
+- `POST /rag/kg/relations`
+- `PATCH /rag/kg/relations/{relation_id}`
+- `DELETE /rag/kg/relations/{relation_id}`
+- `POST /rag/kg/relations/merge`
+- `POST /rag/kg/custom`
+- `GET /healthz`
 
 ## GitHub MCP Setup
 
@@ -147,7 +199,6 @@ What this project shows well:
 Known limitations:
 
 - GitHub MCP citation grounding is less complete than the docs RAG path
-- graph/entity extraction uses deterministic heuristics rather than an LLM extraction pipeline
 - PDF support is limited to text-extractable PDFs and does not include OCR
 - semantic chunking falls back to sliding windows when embeddings are unavailable
 - memory persistence uses a narrow heuristic and a simple JSON fallback
@@ -158,11 +209,30 @@ RepoPilot now models RAG as a small EasyRAG-style subsystem:
 
 - `repopilot/rag/easyrag.py`: main orchestrator with async lifecycle
 - `repopilot/rag/base.py`: pluggable storage abstractions
-- `repopilot/rag/providers.py`: OpenAI-compatible Qwen3 query, embedding, and rerank hooks
+- `repopilot/rag/providers.py`: OpenAI-compatible query, embedding, rerank, and KG extraction hooks
 - `repopilot/rag/chunking.py`: structured, semantic, and sliding-window chunking strategies
+- `repopilot/rag/kg_extraction.py`: LLM KG extraction normalization plus heuristic fallback
 - `repopilot/rag/preprocess.py`: query rewriting and MQE preprocessing
 - `repopilot/rag/kg/`: built-in JSON, dense embedding, token fallback, graph, and status backends
+- `repopilot/rag/production.py`: optional PostgreSQL and Qdrant storage backends
+- `repopilot/api/`: FastAPI service layer and index task orchestration
 - `repopilot/rag/operate.py`: document loading, PDF parsing, insertion, and multi-mode query execution
+
+Index lifecycle behavior:
+
+- `EasyRAG.ainsert()` / `EasyRAG.ainsert_documents()`: true upsert by `doc_id`
+- `EasyRAG.adelete_documents()`: remove one or more indexed docs and all derived graph/vector state
+- `EasyRAG.acreate_entity()` / `aupdate_entity()` / `adelete_entity()` / `amerge_entities()`: manual entity curation
+- `EasyRAG.acreate_relation()` / `aupdate_relation()` / `adelete_relation()` / `amerge_relations()`: manual semantic relation curation
+- `EasyRAG.ainsert_custom_kg()`: batch insert manual entities and relations into the primary graph/vector path
+- `rebuild_document_index()`: full-sync the workspace, including stale-doc cleanup
+
+KG extraction behavior:
+
+- chunk ingestion now uses LLM-backed structured extraction when a compatible model is configured
+- default entity types are architecture-oriented: `component,module,file,service,tool,workflow,concept,config,dependency,interface`
+- if KG model calls fail or are not configured, ingestion falls back to the previous heuristic extraction path
+- semantic relations are stored as first-class relation records, so merge/delete/manual insert operations update both graph state and relation vectors
 
 Supported query modes:
 

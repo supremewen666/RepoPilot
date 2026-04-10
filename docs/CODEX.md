@@ -1,67 +1,49 @@
 ## CODEX.md
 
-This directory contains RepoPilot's EasyRAG-style repository knowledge subsystem.
+This directory documents RepoPilot's teaching-first `RAG-from-scratch` layout.
 
-## Project Overview
+## Canonical Architecture
 
-RepoPilot embeds a single-repository RAG framework that borrows the structure of EasyRAG while staying lightweight enough for an interview-demo scope. The subsystem indexes repository text and PDF documents, extracts heuristic entities and relations, persists graph and dense vector state locally, and exposes multi-mode retrieval with query rewriting and MQE preprocessing to the agent layer.
+The canonical code path now follows the same order we want learners to read:
 
-## Core Architecture
+1. `repopilot/rag/indexing/`
+2. `repopilot/rag/knowledge/`
+3. `repopilot/rag/storage/`
+4. `repopilot/rag/retrieval/`
+5. `repopilot/rag/orchestrator.py`
+6. `repopilot/service/`
 
-### Key Components
+## Core Modules
 
-- `easyrag.py`: main orchestrator class (`EasyRAG`). Always call `await rag.initialize_storages()` before `ainsert()` or `aquery()`, and `await rag.finalize_storages()` when the process is done persisting state.
-- `operate.py`: document loading, PDF parsing, chunk strategy selection, entity and relation extraction, insertion pipeline, and query-mode execution.
-- `base.py`: abstract base classes for `BaseKVStorage`, `BaseVectorStorage`, `BaseGraphStorage`, and `BaseDocStatusStorage`, plus `QueryParam`.
-- `chunking.py`: `structured`, `semantic`, and `sliding_window` chunkers with overlap-aware metadata.
-- `preprocess.py`: query normalization, rewriting, and MQE preparation.
-- `providers.py`: default OpenAI-compatible query, embedding, and rerank providers. The intended defaults are `qwen3-embedding` and `qwen3-rerank`.
-- `kg/`: built-in single-node backends. Current defaults are `JSONKVStorage`, `EmbeddingVectorStorage`, `NetworkXGraphStorage`, and `JSONDocStatusStorage`.
-- `indexer.py`, `retriever.py`, `tool.py`: compatibility layers that map the older RepoPilot API onto the new `EasyRAG` core.
+- `repopilot/rag/orchestrator.py`: `EasyRAG`, the only canonical RAG entry point.
+- `repopilot/rag/types.py`: query/result/config dataclasses and callable aliases.
+- `repopilot/rag/storage/base.py`: storage abstractions.
+- `repopilot/rag/indexing/`: document discovery, chunking, insert preparation, and ingestion pipeline.
+- `repopilot/rag/knowledge/`: KG extraction, graph-to-vector sync, and manual curation payload helpers.
+- `repopilot/rag/retrieval/`: query preprocessing, candidate generation, fusion, hydration, and execution.
+- `repopilot/rag/storage/`: backend bundles and storage implementations grouped by responsibility.
+- `repopilot/service/`: FastAPI, task management, agent runtime, response shaping, and GitHub integration.
+- `repopilot/support/optional_deps.py`: lightweight fallbacks when optional packages are unavailable.
+- `repopilot/config/`: runtime, model, storage, and integration configuration helpers.
 
-### Storage Layer
+## Public API
 
-RepoPilot uses four pluggable storage categories:
+Canonical `repopilot.rag` exports:
 
-- `KV_STORAGE`: documents, chunks, summaries, and optional cache entries
-- `VECTOR_STORAGE`: dense chunk, entity, relation, and summary retrieval records with token fallback
-- `GRAPH_STORAGE`: entity/chunk/document graph structure
-- `DOC_STATUS_STORAGE`: per-document indexing status
+- `EasyRAG`
+- `QueryParam`
+- `QueryResult`
+- `KGExtractionConfig`
+- storage abstract base classes
 
-Workspace isolation uses file-based subdirectories under `.repopilot/rag_storage/<workspace>/`.
+Compatibility shims remain available in the old module paths, but they are no longer the documented source of truth.
 
-### Query Modes
+## Teaching Docs
 
-- `local`: retrieve graph-neighbor chunks around query entities with dense backfill
-- `global`: retrieve broad summary and central-entity context with dense backfill
-- `hybrid`: combine local and global results after query rewriting and MQE
-- `naive`: direct chunk search from dense vector storage
-- `mix`: combine hybrid and naive, then rerank when a reranker is configured
+Read the walkthroughs in this order:
 
-## Development Notes
-
-- Keep comments and user-visible backend text in English.
-- Prefer deterministic behavior over hidden magic. If a heuristic is used, make it explicit and easy to test.
-- The graph and vector layers must stay usable without external services by falling back gracefully when model calls fail.
-- Do not mix GitHub MCP repository metadata into this package's persisted knowledge stores. This package is for repository docs and derived knowledge only.
-- When extending the subsystem, prefer adding new storage implementations under `kg/` or new orchestration behavior in `operate.py` instead of bloating the compatibility wrappers.
-
-## Critical Usage Pattern
-
-```python
-import asyncio
-
-from repopilot.rag import EasyRAG, QueryParam
-
-
-async def main() -> None:
-    rag = EasyRAG()
-    await rag.initialize_storages()
-    await rag.ainsert(["Architecture notes"], ids=["doc::architecture"])
-    result = await rag.aquery("How is indexing designed?", QueryParam(mode="hybrid"))
-    print(result.citations)
-    await rag.finalize_storages()
-
-
-asyncio.run(main())
-```
+- `docs/tutorials/indexing.md`
+- `docs/tutorials/storage.md`
+- `docs/tutorials/retrieval.md`
+- `docs/tutorials/orchestrator.md`
+- `docs/tutorials/service.md`
